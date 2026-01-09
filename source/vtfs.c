@@ -17,6 +17,12 @@ struct dentry* vtfs_mount(
  void* data
 );
 
+struct dentry* vtfs_lookup(
+  struct inode* parent_inode, // родительская нода
+  struct dentry* child_dentry, // объект, к которому мы пытаемся получить доступ
+  unsigned int flag // неиспользуемое значение
+);
+
 struct dentry* mount_nodev(
  struct file_system_type* fs_type,
  int flags,
@@ -30,12 +36,24 @@ struct inode* vtfs_get_inode(
  umode_t mode,
  int i_ino
 );
+int vtfs_permission(struct mnt_idmap *idmap,
+                    struct inode *inode, int mask);
+int vtfs_iterate(struct file* filp, struct dir_context* ctx);
 void vtfs_kill_sb(struct super_block* sb);
 
 struct file_system_type vtfs_fs_type = {
  .name = "vtfs",
  .mount = vtfs_mount,
  .kill_sb = vtfs_kill_sb,
+};
+
+struct inode_operations vtfs_inode_ops = {
+ .lookup = vtfs_lookup,
+ .permission = vtfs_permission,
+};
+
+struct file_operations vtfs_dir_ops = {
+ .iterate_shared = vtfs_iterate,
 };
 
 struct dentry* vtfs_mount(
@@ -53,14 +71,22 @@ struct dentry* vtfs_mount(
  return ret;
 }
 
-
+struct dentry* vtfs_lookup(
+  struct inode* parent_inode, 
+  struct dentry* child_dentry, 
+  unsigned int flag
+) {
+  return NULL;
+}
 
 int vtfs_fill_super(struct super_block *sb, void *data, int silent) {
- struct inode* inode = vtfs_get_inode(sb, NULL, S_IFDIR, 1000);
+ struct inode* inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0777, 1000);
  sb->s_root = d_make_root(inode);
  if (sb->s_root == NULL) {
   return -ENOMEM;
  }
+
+ inode->i_op = &vtfs_inode_ops;
  printk(KERN_INFO "return 0\n");
  return 0;
 }
@@ -71,16 +97,68 @@ struct inode* vtfs_get_inode(
  umode_t mode,
  int i_ino
 ) {
-struct inode *inode = new_inode(sb);
- if (inode != NULL) {
+  struct inode *inode = new_inode(sb);
+  if (!inode)
+      return NULL;
+
+  inode->i_ino = i_ino;
+  inode->i_mode = (mode & S_IFMT) | S_IRWXUGO;
   inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
- }
- inode->i_ino = i_ino;
- return inode;
+
+
+  if (S_ISDIR(mode)) {
+      inode->i_op = &vtfs_inode_ops;
+      inode->i_fop = &vtfs_dir_ops; 
+      
+      set_nlink(inode, 2); 
+  }
+
+  return inode;
+}
+
+int vtfs_iterate(struct file* filp, struct dir_context* ctx) {
+  char fsname[10];
+  struct dentry* dentry = filp->f_path.dentry;
+  struct inode* inode = dentry->d_inode;
+  unsigned long offset = ctx->pos;
+
+  if (inode->i_ino != 1000) {
+      return 0;
+  }
+
+  if (offset == 0) {
+      if (!dir_emit(ctx, ".", 1, inode->i_ino, DT_DIR))
+          return 0;
+      ctx->pos++;
+      offset++;
+  }
+
+  if (offset == 1) {
+      struct inode* parent_inode = dentry->d_parent->d_inode;
+      if (!dir_emit(ctx, "..", 2, parent_inode ? parent_inode->i_ino : 2, DT_DIR))
+          return 0;
+      ctx->pos++;
+      offset++;
+  }
+
+  if (offset == 2) {
+      if (!dir_emit(ctx, "test.txt", 8, 101, DT_REG))
+          return 0;
+      ctx->pos++;
+      offset++;
+  }
+
+  return 0;
 }
 
 void vtfs_kill_sb(struct super_block* sb) {
  printk(KERN_INFO "vtfs super block is destroyed. Unmount successfully.\n");
+}
+
+int vtfs_permission(struct mnt_idmap *idmap,
+                    struct inode *inode, int mask)
+{
+    return 0;
 }
 
 static int __init vtfs_init(void) {
