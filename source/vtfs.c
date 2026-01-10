@@ -14,7 +14,7 @@ MODULE_DESCRIPTION("A simple FS kernel module");
 #define LOG(fmt, ...) pr_info("[" MODULE_NAME "]: " fmt, ##__VA_ARGS__)
 #define VTFS_MAX_NAME_LEN 256
 #define VTFS_MAX_DATA_SIZE 4096
-
+#define ROOT_INO 1000
 
 struct vtfs_inode_data {
     ino_t ino;
@@ -38,7 +38,6 @@ struct vtfs_super_info {
 };
 
 static struct vtfs_super_info vtfs_sb_info;
-
 
 static struct vtfs_inode_data *vtfs_find_inode(ino_t ino)
 {
@@ -128,6 +127,22 @@ static int vtfs_remove_child(ino_t parent_ino, const char *name)
     return vtfs_remove_inode(child->ino);
 }
 
+static bool vtfs_dir_is_empty(ino_t dir_ino)
+{
+    struct vtfs_inode_data *entry;
+    bool empty = true;
+    
+    read_lock(&vtfs_sb_info.lock);
+    list_for_each_entry(entry, &vtfs_sb_info.inodes, list) {
+        if (entry->parent_ino == dir_ino) {
+            empty = false;
+            break;
+        }
+    }
+    read_unlock(&vtfs_sb_info.lock);
+    
+    return empty;
+}
 
 struct dentry* vtfs_mount(
     struct file_system_type* fs_type, int flags, const char* token, void* data
@@ -137,6 +152,8 @@ struct dentry* vtfs_lookup(
     struct inode* parent_inode, struct dentry* child_dentry, unsigned int flag
 );
 
+static ino_t ino_cnt = ROOT_INO;
+
 int vtfs_unlink(struct inode* parent_inode, struct dentry* child_dentry);
 int vtfs_create(
     struct mnt_idmap* idmap,
@@ -145,6 +162,15 @@ int vtfs_create(
     umode_t mode,
     bool b
 );
+
+int vtfs_mkdir(
+    struct mnt_idmap* idmap,
+    struct inode* parent_inode,
+    struct dentry* child_dentry,
+    umode_t mode
+);
+
+int vtfs_rmdir(struct inode* parent_inode, struct dentry* child_dentry);
 
 struct dentry* mount_nodev(
     struct file_system_type* fs_type,
@@ -170,7 +196,9 @@ struct inode_operations vtfs_inode_ops = {
     .lookup = vtfs_lookup,
     .permission = vtfs_permission,
     .create = vtfs_create,
-    .unlink = vtfs_unlink
+    .unlink = vtfs_unlink,
+    .mkdir = vtfs_mkdir,
+    .rmdir = vtfs_rmdir
 };
 
 struct file_operations vtfs_dir_ops = {
@@ -196,8 +224,9 @@ struct dentry* vtfs_lookup(
     struct vtfs_inode_data *inode_data;
     
     inode_data = vtfs_find_child(parent_inode->i_ino, name);
-    if (!inode_data)
+    if (!inode_data) {
         return NULL;
+    }
     
     struct inode* inode = vtfs_get_inode(parent_inode->i_sb, NULL, 
                                         inode_data->mode, inode_data->ino);
@@ -220,10 +249,10 @@ int vtfs_create(
     
     if (vtfs_find_child(parent_inode->i_ino, name))
         return -EEXIST;
+  
+    ino = ++ino_cnt;
     
-    static ino_t next_ino = 1000;
-    ino = next_ino++;
-    
+    mode |= S_IFREG;
     struct vtfs_inode_data *inode_data = vtfs_create_inode(ino, mode, name, 
                                                            parent_inode->i_ino);
     if (!inode_data)
@@ -240,21 +269,77 @@ int vtfs_create(
     return 0;
 }
 
+int vtfs_mkdir(
+    struct mnt_idmap* idmap,
+    struct inode* parent_inode,
+    struct dentry* child_dentry,
+    umode_t mode
+) {
+    const char* name = child_dentry->d_name.name;
+    ino_t ino;
+    
+    if (vtfs_find_child(parent_inode->i_ino, name))
+        return -EEXIST;
+    
+    ino = ++ino_cnt;
+    
+    mode |= S_IFDIR;
+    struct vtfs_inode_data *inode_data = vtfs_create_inode(ino, mode, name, 
+                                                           parent_inode->i_ino);
+    if (!inode_data)
+        return -ENOMEM;
+    
+    struct inode* inode = vtfs_get_inode(parent_inode->i_sb, NULL, mode, ino);
+    if (!inode)
+        return -ENOMEM;
+    
+    inode->i_op = &vtfs_inode_ops;
+    inode->i_fop = &vtfs_dir_ops;
+    set_nlink(inode, 2);
+    d_add(child_dentry, inode);
+    
+    return 0;
+}
+
 int vtfs_unlink(struct inode* parent_inode, struct dentry* child_dentry) {
     const char* name = child_dentry->d_name.name;
+    struct vtfs_inode_data *child;
     
-    return vtfs_remove_child(parent_inode->i_ino, name);
+    child = vtfs_find_child(parent_inode->i_ino, name);
+    if (!child)
+        return -ENOENT;
+    
+    if (S_ISDIR(child->mode))
+        return -EISDIR;
+    
+    return vtfs_remove_inode(child->ino);
+}
+
+int vtfs_rmdir(struct inode* parent_inode, struct dentry* child_dentry) {
+    const char* name = child_dentry->d_name.name;
+    struct vtfs_inode_data *child;
+    
+    child = vtfs_find_child(parent_inode->i_ino, name);
+    if (!child)
+        return -ENOENT;
+    
+    if (!S_ISDIR(child->mode))
+        return -ENOTDIR;
+    if (!vtfs_dir_is_empty(child->ino))
+        return -ENOTEMPTY;
+
+    return vtfs_remove_inode(child->ino);
 }
 
 int vtfs_fill_super(struct super_block* sb, void* data, int silent) {
     INIT_LIST_HEAD(&vtfs_sb_info.inodes);
     rwlock_init(&vtfs_sb_info.lock);
     
-    struct vtfs_inode_data *root_data = vtfs_create_inode(100, S_IFDIR | 0777, "", 0);
+    struct vtfs_inode_data *root_data = vtfs_create_inode(ROOT_INO, S_IFDIR | 0777, "", 0);
     if (!root_data)
         return -ENOMEM;
     
-    struct inode* inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0777, 100);
+    struct inode* inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0777, ROOT_INO);
     sb->s_root = d_make_root(inode);
     if (sb->s_root == NULL) {
         return -ENOMEM;

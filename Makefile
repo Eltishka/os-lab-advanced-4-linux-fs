@@ -39,6 +39,7 @@ reload: unload load
 
 # Монтирование файловой системы
 mount-dir:
+	sudo rmdir /mnt/vtfs
 	@if [ ! -d $(MOUNT_POINT) ]; then \
 		echo "Creating mount point $(MOUNT_POINT)"; \
 		sudo mkdir -p $(MOUNT_POINT); \
@@ -47,7 +48,7 @@ mount-dir:
 		echo "Mount point $(MOUNT_POINT) already exists"; \
 	fi
 
-mount: load mount-dir
+mount: umount unload load mount-dir
 	@if mountpoint -q $(MOUNT_POINT); then \
 		echo "Already mounted at $(MOUNT_POINT)"; \
 	else \
