@@ -16,19 +16,17 @@ MODULE_DESCRIPTION("A simple FS kernel module");
 #define VTFS_MAX_DATA_SIZE 4096
 #define ROOT_INO 1000
 
+struct file_data {
+  char *data;
+  size_t size;
+};
+
 struct vtfs_inode_data {
     ino_t ino;
     umode_t mode;
     char name[VTFS_MAX_NAME_LEN];
     ino_t parent_ino; 
-    
-    union {
-        struct {
-            char *data;
-            size_t size;
-        } file;
-    };
-    
+    struct file_data* file;
     struct list_head list;
 };
 
@@ -43,12 +41,12 @@ static int vtfs_resize_file_data(struct vtfs_inode_data *inode_data, size_t new_
 {
     char *new_data;
     
-    new_data = krealloc(inode_data->file.data, new_size, GFP_KERNEL);
+    new_data = krealloc(inode_data->file->data, new_size, GFP_KERNEL);
     if (!new_data)
         return -ENOMEM;
     
-    inode_data->file.data = new_data;
-    inode_data->file.size = new_size;
+    inode_data->file->data = new_data;
+    inode_data->file->size = new_size;
     
     return 0;
 }
@@ -100,8 +98,15 @@ static struct vtfs_inode_data *vtfs_create_inode(ino_t ino, umode_t mode,
     inode_data->name[VTFS_MAX_NAME_LEN - 1] = '\0';
     
     if (S_ISREG(mode)) {
-        inode_data->file.data = NULL;
-        inode_data->file.size = 0;
+        inode_data->file = kzalloc(sizeof(struct file_data), GFP_KERNEL);
+        if (!inode_data->file) {
+            kfree(inode_data);
+            return NULL;
+        }
+        inode_data->file->data = NULL;
+        inode_data->file->size = 0;
+    } else {
+        inode_data->file = NULL;
     }
     
     write_lock(&vtfs_sb_info.lock);
@@ -123,8 +128,13 @@ static int vtfs_remove_inode(ino_t ino)
     list_del(&inode_data->list);
     write_unlock(&vtfs_sb_info.lock);
     
-    if (S_ISREG(inode_data->mode) && inode_data->file.data)
-        kfree(inode_data->file.data);
+    if (S_ISREG(inode_data->mode)) {
+        if (inode_data->file) {
+            if (inode_data->file->data)
+                kfree(inode_data->file->data);
+            kfree(inode_data->file);
+        }
+    }
     
     kfree(inode_data);
     return 0;
@@ -186,6 +196,8 @@ int vtfs_mkdir(
 
 int vtfs_rmdir(struct inode* parent_inode, struct dentry* child_dentry);
 
+int vtfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry);
+
 struct dentry* mount_nodev(
     struct file_system_type* fs_type,
     int flags,
@@ -214,7 +226,8 @@ struct inode_operations vtfs_inode_ops = {
     .create = vtfs_create,
     .unlink = vtfs_unlink,
     .mkdir = vtfs_mkdir,
-    .rmdir = vtfs_rmdir
+    .rmdir = vtfs_rmdir,
+    .link = vtfs_link  
 };
 
 struct file_operations vtfs_dir_ops = {
@@ -329,7 +342,36 @@ int vtfs_unlink(struct inode* parent_inode, struct dentry* child_dentry) {
     if (S_ISDIR(child->mode))
         return -EISDIR;
     
-    return vtfs_remove_inode(child->ino);
+    write_lock(&vtfs_sb_info.lock);
+    list_del(&child->list);
+    write_unlock(&vtfs_sb_info.lock);
+    
+    struct vtfs_inode_data *entry;
+    int link_count = 0;
+    
+    read_lock(&vtfs_sb_info.lock);
+    list_for_each_entry(entry, &vtfs_sb_info.inodes, list) {
+        if (entry->ino == child->ino) {
+            link_count++;
+        }
+    }
+    read_unlock(&vtfs_sb_info.lock);
+    
+    if (link_count == 0) {
+        if (child->file) {
+            if (child->file->data)
+                kfree(child->file->data);
+            kfree(child->file);
+        }
+    }
+    
+    kfree(child);
+    
+    if (link_count > 0) {
+        drop_nlink(child_dentry->d_inode);
+    }
+    
+    return 0;
 }
 
 int vtfs_rmdir(struct inode* parent_inode, struct dentry* child_dentry) {
@@ -346,6 +388,44 @@ int vtfs_rmdir(struct inode* parent_inode, struct dentry* child_dentry) {
         return -ENOTEMPTY;
 
     return vtfs_remove_inode(child->ino);
+}
+
+int vtfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry) {
+    struct inode *inode = old_dentry->d_inode;
+    const char *new_name = new_dentry->d_name.name;
+    struct vtfs_inode_data *inode_data;
+    
+    inode_data = vtfs_find_inode(inode->i_ino);
+    if (!inode_data)
+        return -ENOENT;
+    
+    if (!S_ISREG(inode_data->mode))
+        return -EPERM;
+    
+    if (vtfs_find_child(dir->i_ino, new_name))
+        return -EEXIST;
+    
+    struct vtfs_inode_data *new_link;
+    new_link = kzalloc(sizeof(*new_link), GFP_KERNEL);
+    if (!new_link)
+        return -ENOMEM;
+    
+    new_link->ino = inode_data->ino;
+    new_link->mode = inode_data->mode;
+    new_link->parent_ino = dir->i_ino;
+    new_link->file = inode_data->file;
+    strncpy(new_link->name, new_name, VTFS_MAX_NAME_LEN - 1);
+    new_link->name[VTFS_MAX_NAME_LEN - 1] = '\0';
+    
+    write_lock(&vtfs_sb_info.lock);
+    list_add_tail(&new_link->list, &vtfs_sb_info.inodes);
+    write_unlock(&vtfs_sb_info.lock);
+    
+    inc_nlink(inode);
+    
+    d_instantiate(new_dentry, igrab(inode));
+    
+    return 0;
 }
 
 int vtfs_fill_super(struct super_block* sb, void* data, int silent) {
@@ -380,7 +460,6 @@ struct inode* vtfs_get_inode(
     if (S_ISDIR(mode)) {
         inode->i_op = &vtfs_inode_ops;
         inode->i_fop = &vtfs_dir_ops;
-        set_nlink(inode, 2);
     } else {
         inode->i_op = &vtfs_inode_ops;
         inode->i_fop = &vtfs_file_ops;
@@ -455,11 +534,8 @@ ssize_t vtfs_write(struct file *filp, const char __user *buffer, size_t len, lof
     if (!inode_data)
         return -ENOENT;
     
-    if (!S_ISREG(inode_data->mode))
-        return -EINVAL;
-    
     if (filp->f_flags & O_APPEND) {
-        write_pos = inode_data->file.size;
+        write_pos = inode_data->file->size;
     } else {
         write_pos = *offset;
     }
@@ -470,13 +546,13 @@ ssize_t vtfs_write(struct file *filp, const char __user *buffer, size_t len, lof
     if (ret)
         return ret;
     
-    if (inode_data->file.data) {
-        ret = copy_from_user(inode_data->file.data + write_pos, buffer, len);
+    if (inode_data->file->data) {
+        ret = copy_from_user(inode_data->file->data + write_pos, buffer, len);
         if (ret)
             return -EFAULT;
     }
     
-    inode_data->file.size = new_size;
+    inode_data->file->size = new_size;
     
     *offset = write_pos + len;
     
@@ -497,15 +573,15 @@ ssize_t vtfs_read(struct file *filp, char __user *buffer, size_t len, loff_t *of
     if (!S_ISREG(inode_data->mode))
         return -EINVAL;
     
-    if (!inode_data->file.data || inode_data->file.size == 0)
+    if (!inode_data->file->data || inode_data->file->size == 0)
         return 0;
     
-    if (*offset >= inode_data->file.size)
+    if (*offset >= inode_data->file->size)
         return 0;
     
-    to_read = min(len, inode_data->file.size - *offset);
+    to_read = min(len, inode_data->file->size - *offset);
     
-    ret = copy_to_user(buffer, inode_data->file.data + *offset, to_read);
+    ret = copy_to_user(buffer, inode_data->file->data + *offset, to_read);
     if (ret)
         return -EFAULT;
     
@@ -520,8 +596,10 @@ void vtfs_kill_sb(struct super_block* sb) {
     write_lock(&vtfs_sb_info.lock);
     list_for_each_entry_safe(entry, tmp, &vtfs_sb_info.inodes, list) {
         list_del(&entry->list);
-        if (S_ISREG(entry->mode) && entry->file.data)
-            kfree(entry->file.data);
+        if (S_ISREG(entry->mode) && entry->file->data) {
+            kfree(entry->file->data);
+            kfree(entry->file);
+        }
         kfree(entry);
     }
     write_unlock(&vtfs_sb_info.lock);
