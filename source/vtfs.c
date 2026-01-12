@@ -4,6 +4,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/rwlock.h>
+#include <linux/base64.h>
+#include "http.h"
 
 #define MODULE_NAME "vtfs"
 
@@ -13,8 +15,31 @@ MODULE_DESCRIPTION("A simple FS kernel module");
 
 #define LOG(fmt, ...) pr_info("[" MODULE_NAME "]: " fmt, ##__VA_ARGS__)
 #define VTFS_MAX_NAME_LEN 256
-#define VTFS_MAX_DATA_SIZE 4096
 #define ROOT_INO 1000
+#define HTTP_BUFFER_SIZE 4096
+#define LARGE_HTTP_BUFFER_SIZE 4096000
+#define INO_BUFFER_SIZE 64
+
+#define HTTP_METHOD_GET "GET"
+#define HTTP_METHOD_POST "POST"
+#define HTTP_METHOD_PUT "PUT"
+#define HTTP_METHOD_DELETE "DELETE"
+
+#define ENDPOINT_INODE_BY_INO "/inodeByIno"
+#define ENDPOINT_INODE_BY_PARENT "/inodeByParentInoAndName"
+#define ENDPOINT_CREATE_INODE "/createInode"
+#define ENDPOINT_DELETE_INODE "/deleteInode"
+#define ENDPOINT_GET_ALL "/getAll"
+#define ENDPOINT_FILE_BY_INO "/fileByIno"
+#define ENDPOINT_FILES "/files"
+#define ENDPOINT_GET_MAX_INO "/getMaxIno"
+
+#define JSON_FIELD_INO "\"ino\":"
+#define JSON_FIELD_MODE "\"mode\":"
+#define JSON_FIELD_NAME "\"name\":\""
+#define JSON_FIELD_PARENT_INO "\"parentIno\":"
+#define JSON_FIELD_SIZE "\"size\":"
+#define JSON_FIELD_DATA "\"data\":\""
 
 struct file_data {
   char *data;
@@ -26,66 +51,218 @@ struct vtfs_inode_data {
     umode_t mode;
     char name[VTFS_MAX_NAME_LEN];
     ino_t parent_ino; 
-    struct file_data* file;
     struct list_head list;
 };
 
-struct vtfs_super_info {
-    struct list_head inodes;
-    rwlock_t lock;
-};
-
-static struct vtfs_super_info vtfs_sb_info;
-
-static int vtfs_resize_file_data(struct vtfs_inode_data *inode_data, size_t new_size)
+static int parse_json_file_data(const char *json, struct file_data *fdata)
 {
-    char *new_data;
-    
-    new_data = krealloc(inode_data->file->data, new_size, GFP_KERNEL);
-    if (!new_data)
+    const char *data_start = NULL;
+    const char *data_end = NULL;
+    const char *size_start = NULL;
+    char *decoded_data = NULL;
+    size_t encoded_len = 0;
+    size_t decoded_len = 0;
+    long size = 0;
+    char *size_endptr = NULL;
+    int ret = 0;
+
+    if (!json || !fdata) {
+        return -EINVAL;
+    }
+
+    fdata->data = NULL;
+    fdata->size = 0;
+
+    size_start = strstr(json, JSON_FIELD_SIZE);
+    if (!size_start) {
+        return 0;
+    }
+    size_start += strlen(JSON_FIELD_SIZE); 
+    size = simple_strtol(size_start, &size_endptr, 10);
+    fdata->size = (size_t)size;
+    data_start = strstr(json, JSON_FIELD_DATA);
+    data_start += strlen(JSON_FIELD_DATA); 
+    data_end = strchr(data_start, '\"');
+
+    encoded_len = data_end - data_start;
+    decoded_data = kmalloc(fdata->size, GFP_KERNEL);
+    if (!decoded_data) {
         return -ENOMEM;
+    }
+
+    decoded_len = base64_decode(data_start, encoded_len, decoded_data);
+    fdata->data = decoded_data;
+
+    return 0;
+}
+
+
+static int parse_json_inode(const char *json, struct vtfs_inode_data *inode) {
+    char *ptr = (char *)json;
+    char *ino_start, *mode_start, *name_start, *parent_start, *name_end;
+    size_t name_len;
     
-    inode_data->file->data = new_data;
-    inode_data->file->size = new_size;
+    ino_start = strstr(ptr, JSON_FIELD_INO);
+    if (!ino_start) return -EINVAL;
+    ino_start += strlen(JSON_FIELD_INO); 
+    
+    mode_start = strstr(ptr, JSON_FIELD_MODE);
+    if (!mode_start) return -EINVAL;
+    mode_start += strlen(JSON_FIELD_MODE); 
+    
+    name_start = strstr(ptr, JSON_FIELD_NAME);
+    if (!name_start) return -EINVAL;
+    name_start += strlen(JSON_FIELD_NAME); 
+    
+    parent_start = strstr(ptr, JSON_FIELD_PARENT_INO);
+    if (!parent_start) return -EINVAL;
+    parent_start += strlen(JSON_FIELD_PARENT_INO);
+    
+    inode->ino = simple_strtoul(ino_start, NULL, 10);
+    inode->mode = simple_strtoul(mode_start, NULL, 10);
+    inode->parent_ino = simple_strtoul(parent_start, NULL, 10);
+    
+    name_end = strchr(name_start, '"');
+    if (!name_end) return -EINVAL;
+    
+    name_len = name_end - name_start;
+    if (name_len >= VTFS_MAX_NAME_LEN)
+        name_len = VTFS_MAX_NAME_LEN - 1;
+    
+    strncpy(inode->name, name_start, name_len);
+    inode->name[name_len] = '\0';
+    return 0;
+}
+
+static void free_inodes_list(struct list_head *inodes_list)
+{
+    struct vtfs_inode_data *entry, *tmp;
+    
+    list_for_each_entry_safe(entry, tmp, inodes_list, list) {
+        list_del(&entry->list);
+        kfree(entry);
+    }
+}
+
+static int parse_inode_array(const char *json, struct list_head *inodes_list) {
+    char *ptr = (char *)json;
+    
+    ptr = strchr(ptr, '[');
+    if (!ptr) return -EINVAL;
+    ptr++; 
+    
+    while (*ptr && *ptr != ']') {
+        while (*ptr && (*ptr == ' ' || *ptr == '\n' || *ptr == '\t' || *ptr == ','))
+            ptr++;
+        
+        if (*ptr == ']') break;
+        if (*ptr != '{') return -EINVAL;
+        
+        struct vtfs_inode_data *inode = kzalloc(sizeof(*inode), GFP_KERNEL);
+        if (!inode) {
+            free_inodes_list(inodes_list);
+            return -ENOMEM;
+        }
+        
+        INIT_LIST_HEAD(&inode->list); 
+        
+        int ret = parse_json_inode(ptr, inode);
+        if (ret) {
+            kfree(inode);
+            free_inodes_list(inodes_list);
+            return ret;
+        }
+        
+        list_add_tail(&inode->list, inodes_list);
+        
+        ptr = strchr(ptr, '}');
+        if (!ptr) break;
+        ptr++;
+    }
     
     return 0;
 }
 
 static struct vtfs_inode_data *vtfs_find_inode(ino_t ino)
 {
-    struct vtfs_inode_data *entry;
+    struct vtfs_inode_data *entry = kzalloc(sizeof(struct vtfs_inode_data), GFP_KERNEL);
+    char *response_buffer = kzalloc(HTTP_BUFFER_SIZE, GFP_KERNEL); 
+    char *ino_str;
+    int64_t ret;
     
-    read_lock(&vtfs_sb_info.lock);
-    list_for_each_entry(entry, &vtfs_sb_info.inodes, list) {
-        if (entry->ino == ino) {
-            read_unlock(&vtfs_sb_info.lock);
-            return entry;
-        }
+    if (!entry || !response_buffer) {
+        kfree(entry);
+        kfree(response_buffer);
+        return NULL;
     }
-    read_unlock(&vtfs_sb_info.lock);
-    return NULL;
+    
+    ino_str = kasprintf(GFP_KERNEL, "%lu", ino);
+    if (!ino_str) {
+        kfree(entry);
+        kfree(response_buffer);
+        return NULL;
+    }
+    
+    ret = vtfs_http_call(ENDPOINT_INODE_BY_INO, HTTP_METHOD_GET, response_buffer, HTTP_BUFFER_SIZE, 1, "ino", ino_str);
+    kfree(ino_str);
+    
+    if(ret < 0) {
+        kfree(entry);
+        kfree(response_buffer);
+        return NULL;
+    }
+    
+    if (parse_json_inode(response_buffer, entry) < 0) {
+        kfree(entry);
+        kfree(response_buffer);
+        return NULL;
+    }
+    
+    kfree(response_buffer);
+    return entry;
 }
 
 static struct vtfs_inode_data *vtfs_find_child(ino_t parent_ino, const char *name)
 {
-    struct vtfs_inode_data *entry;
+    struct vtfs_inode_data *entry = kzalloc(sizeof(struct vtfs_inode_data), GFP_KERNEL);
+    char *response_buffer = kzalloc(HTTP_BUFFER_SIZE, GFP_KERNEL);
+    char *parent_ino_str;
+    int64_t ret;
     
-    read_lock(&vtfs_sb_info.lock);
-    list_for_each_entry(entry, &vtfs_sb_info.inodes, list) {
-        if (entry->parent_ino == parent_ino && 
-            strcmp(entry->name, name) == 0) {
-            read_unlock(&vtfs_sb_info.lock);
-            return entry;
-        }
+    if (!entry || !response_buffer) {
+        kfree(entry);
+        kfree(response_buffer);
+        return NULL;
     }
-    read_unlock(&vtfs_sb_info.lock);
-    return NULL;
+    
+    parent_ino_str = kasprintf(GFP_KERNEL, "%lu", parent_ino);
+    if (!parent_ino_str) {
+        kfree(entry);
+        kfree(response_buffer);
+        return NULL;
+    }
+    
+    ret = vtfs_http_call(ENDPOINT_INODE_BY_PARENT, HTTP_METHOD_GET, response_buffer, HTTP_BUFFER_SIZE, 2, 
+                        "parentIno", parent_ino_str, "name", name);
+    kfree(parent_ino_str);
+    
+    if(ret < 0 || parse_json_inode(response_buffer, entry) < 0) {
+        kfree(entry);
+        kfree(response_buffer);
+        return NULL;
+    }
+    
+    kfree(response_buffer);
+    return entry;
 }
 
 static struct vtfs_inode_data *vtfs_create_inode(ino_t ino, umode_t mode, 
                                                   const char *name, ino_t parent_ino)
 {
     struct vtfs_inode_data *inode_data;
+    char *response_buffer;
+    char *ino_str, *mode_str, *parent_ino_str;
+    int64_t ret;
     
     inode_data = kzalloc(sizeof(*inode_data), GFP_KERNEL);
     if (!inode_data)
@@ -97,21 +274,40 @@ static struct vtfs_inode_data *vtfs_create_inode(ino_t ino, umode_t mode,
     strncpy(inode_data->name, name, VTFS_MAX_NAME_LEN - 1);
     inode_data->name[VTFS_MAX_NAME_LEN - 1] = '\0';
     
-    if (S_ISREG(mode)) {
-        inode_data->file = kzalloc(sizeof(struct file_data), GFP_KERNEL);
-        if (!inode_data->file) {
-            kfree(inode_data);
-            return NULL;
-        }
-        inode_data->file->data = NULL;
-        inode_data->file->size = 0;
-    } else {
-        inode_data->file = NULL;
+    response_buffer = kzalloc(HTTP_BUFFER_SIZE, GFP_KERNEL);
+    if (!response_buffer) {
+        kfree(inode_data);
+        return NULL;
     }
     
-    write_lock(&vtfs_sb_info.lock);
-    list_add_tail(&inode_data->list, &vtfs_sb_info.inodes);
-    write_unlock(&vtfs_sb_info.lock);
+    ino_str = kasprintf(GFP_KERNEL, "%lu", ino);
+    mode_str = kasprintf(GFP_KERNEL, "%u", mode);
+    parent_ino_str = kasprintf(GFP_KERNEL, "%lu", parent_ino);
+    
+    if (!ino_str || !mode_str || !parent_ino_str) {
+        kfree(ino_str);
+        kfree(mode_str);
+        kfree(parent_ino_str);
+        kfree(response_buffer);
+        kfree(inode_data);
+        return NULL;
+    }
+    
+    ret = vtfs_http_call(ENDPOINT_CREATE_INODE, HTTP_METHOD_GET, response_buffer, HTTP_BUFFER_SIZE, 4, 
+                     "ino", ino_str,
+                     "mode", mode_str,
+                     "name", name,
+                     "parentIno", parent_ino_str);
+    
+    kfree(ino_str);
+    kfree(mode_str);
+    kfree(parent_ino_str);
+    kfree(response_buffer);
+    
+    if (ret < 0) {
+        kfree(inode_data);
+        return NULL;
+    }
     
     return inode_data;
 }
@@ -119,51 +315,71 @@ static struct vtfs_inode_data *vtfs_create_inode(ino_t ino, umode_t mode,
 static int vtfs_remove_inode(ino_t ino)
 {
     struct vtfs_inode_data *inode_data;
+    char *response_buffer;
+    char *ino_str;
     
     inode_data = vtfs_find_inode(ino);
     if (!inode_data)
         return -ENOENT;
     
-    write_lock(&vtfs_sb_info.lock);
-    list_del(&inode_data->list);
-    write_unlock(&vtfs_sb_info.lock);
-    
-    if (S_ISREG(inode_data->mode)) {
-        if (inode_data->file) {
-            if (inode_data->file->data)
-                kfree(inode_data->file->data);
-            kfree(inode_data->file);
-        }
+    response_buffer = kzalloc(HTTP_BUFFER_SIZE, GFP_KERNEL);
+    if (!response_buffer) {
+        kfree(inode_data);
+        return -ENOMEM;
     }
     
+    ino_str = kasprintf(GFP_KERNEL, "%lu", inode_data->ino);
+    if (!ino_str) {
+        kfree(response_buffer);
+        kfree(inode_data);
+        return -ENOMEM;
+    }
+    
+    vtfs_http_call(ENDPOINT_DELETE_INODE, HTTP_METHOD_DELETE, response_buffer, HTTP_BUFFER_SIZE, 2, 
+                   "ino", ino_str,
+                   "name", inode_data->name);
+    
+    kfree(ino_str);
+    kfree(response_buffer);
     kfree(inode_data);
+    
     return 0;
-}
-
-static int vtfs_remove_child(ino_t parent_ino, const char *name)
-{
-    struct vtfs_inode_data *child;
-    
-    child = vtfs_find_child(parent_ino, name);
-    if (!child)
-        return -ENOENT;
-    
-    return vtfs_remove_inode(child->ino);
 }
 
 static bool vtfs_dir_is_empty(ino_t dir_ino)
 {
     struct vtfs_inode_data *entry;
     bool empty = true;
+    char *response_buffer = NULL;
+    struct list_head inodes;
     
-    read_lock(&vtfs_sb_info.lock);
-    list_for_each_entry(entry, &vtfs_sb_info.inodes, list) {
+    INIT_LIST_HEAD(&inodes);
+    
+    response_buffer = kzalloc(LARGE_HTTP_BUFFER_SIZE, GFP_KERNEL);
+    if (!response_buffer)
+        return true;
+    
+    if (vtfs_http_call(ENDPOINT_GET_ALL, HTTP_METHOD_GET, response_buffer, LARGE_HTTP_BUFFER_SIZE, 0) < 0) {
+        kfree(response_buffer);
+        return true;
+    }
+    
+    if (parse_inode_array(response_buffer, &inodes) != 0) {
+        kfree(response_buffer);
+        free_inodes_list(&inodes);
+        return true;
+    }
+    
+    kfree(response_buffer);
+    
+    list_for_each_entry(entry, &inodes, list) {
         if (entry->parent_ino == dir_ino) {
             empty = false;
             break;
         }
     }
-    read_unlock(&vtfs_sb_info.lock);
+    
+    free_inodes_list(&inodes);
     
     return empty;
 }
@@ -256,17 +472,26 @@ struct dentry* vtfs_lookup(
 ) {
     const char* name = child_dentry->d_name.name;
     struct vtfs_inode_data *inode_data;
+    struct inode* inode = NULL;
     
     inode_data = vtfs_find_child(parent_inode->i_ino, name);
+    
     if (!inode_data) {
+        d_add(child_dentry, NULL);
         return NULL;
     }
     
-    struct inode* inode = vtfs_get_inode(parent_inode->i_sb, NULL, 
-                                        inode_data->mode, inode_data->ino);
-    if (inode) {
-        d_add(child_dentry, inode);
+    inode = vtfs_get_inode(parent_inode->i_sb, NULL, 
+                          inode_data->mode, inode_data->ino);
+    
+    kfree(inode_data);
+    
+    if (!inode) {
+        d_add(child_dentry, NULL);
+        return NULL;
     }
+
+    d_add(child_dentry, inode);
     
     return NULL;
 }
@@ -280,22 +505,27 @@ int vtfs_create(
 ) {
     const char* name = child_dentry->d_name.name;
     ino_t ino;
+    struct vtfs_inode_data *inode_data;
+    struct inode* inode;
     
-    if (vtfs_find_child(parent_inode->i_ino, name))
+    if (vtfs_find_child(parent_inode->i_ino, name)) {
         return -EEXIST;
+    }
   
     ino = ++ino_cnt;
     
     mode |= S_IFREG;
-    struct vtfs_inode_data *inode_data = vtfs_create_inode(ino, mode, name, 
-                                                           parent_inode->i_ino);
+    inode_data = vtfs_create_inode(ino, mode, name, parent_inode->i_ino);
     if (!inode_data)
         return -ENOMEM;
     
-    struct inode* inode = vtfs_get_inode(parent_inode->i_sb, NULL, mode, ino);
-    if (!inode)
+    inode = vtfs_get_inode(parent_inode->i_sb, NULL, mode, ino);
+    if (!inode) {
+        kfree(inode_data);
         return -ENOMEM;
+    }
     
+    kfree(inode_data);
     d_add(child_dentry, inode);
     
     return 0;
@@ -309,23 +539,28 @@ int vtfs_mkdir(
 ) {
     const char* name = child_dentry->d_name.name;
     ino_t ino;
+    struct vtfs_inode_data *inode_data;
+    struct inode* inode;
     
-    if (vtfs_find_child(parent_inode->i_ino, name))
+    if (vtfs_find_child(parent_inode->i_ino, name)) {
         return -EEXIST;
+    }
     
     ino = ++ino_cnt;
     
     mode |= S_IFDIR;
-    struct vtfs_inode_data *inode_data = vtfs_create_inode(ino, mode, name, 
-                                                           parent_inode->i_ino);
+    inode_data = vtfs_create_inode(ino, mode, name, parent_inode->i_ino);
     if (!inode_data)
         return -ENOMEM;
     
-    struct inode* inode = vtfs_get_inode(parent_inode->i_sb, NULL, mode, ino);
-    if (!inode)
+    inode = vtfs_get_inode(parent_inode->i_sb, NULL, mode, ino);
+    if (!inode) {
+        kfree(inode_data);
         return -ENOMEM;
+    }
     
     set_nlink(inode, 2);
+    kfree(inode_data);
     d_add(child_dentry, inode);
     
     return 0;
@@ -334,42 +569,91 @@ int vtfs_mkdir(
 int vtfs_unlink(struct inode* parent_inode, struct dentry* child_dentry) {
     const char* name = child_dentry->d_name.name;
     struct vtfs_inode_data *child;
+    struct vtfs_inode_data *entry;
+    char *response_buffer = NULL;
+    char *del = NULL;
+    char *ino_str = NULL;
+    struct list_head inodes;
+    int link_count = 0;
     
     child = vtfs_find_child(parent_inode->i_ino, name);
     if (!child)
         return -ENOENT;
     
-    if (S_ISDIR(child->mode))
+    if (S_ISDIR(child->mode)) {
+        kfree(child);
         return -EISDIR;
+    }
     
-    write_lock(&vtfs_sb_info.lock);
-    list_del(&child->list);
-    write_unlock(&vtfs_sb_info.lock);
+    del = kzalloc(HTTP_BUFFER_SIZE, GFP_KERNEL);
+    if (!del) {
+        kfree(child);
+        return -ENOMEM;
+    }
     
-    struct vtfs_inode_data *entry;
-    int link_count = 0;
+    ino_str = kasprintf(GFP_KERNEL, "%lu", child->ino);
+    if (!ino_str) {
+        kfree(del);
+        kfree(child);
+        return -ENOMEM;
+    }
     
-    read_lock(&vtfs_sb_info.lock);
-    list_for_each_entry(entry, &vtfs_sb_info.inodes, list) {
+    vtfs_http_call(ENDPOINT_DELETE_INODE, HTTP_METHOD_DELETE, del, HTTP_BUFFER_SIZE, 2, 
+                   "ino", ino_str,
+                   "name", child->name);
+    
+    kfree(del);
+    kfree(ino_str);
+    
+    response_buffer = kzalloc(LARGE_HTTP_BUFFER_SIZE, GFP_KERNEL);
+    if (!response_buffer) {
+        kfree(child);
+        return -ENOMEM;
+    }
+    
+    INIT_LIST_HEAD(&inodes);
+    
+    if (vtfs_http_call(ENDPOINT_GET_ALL, HTTP_METHOD_GET, response_buffer, LARGE_HTTP_BUFFER_SIZE, 0) < 0) {
+        kfree(response_buffer);
+        kfree(child);
+        return -EIO;
+    }
+    
+    if (parse_inode_array(response_buffer, &inodes) != 0) {
+        kfree(response_buffer);
+        free_inodes_list(&inodes);
+        kfree(child);
+        return -EIO;
+    }
+    
+    kfree(response_buffer);
+    
+    list_for_each_entry(entry, &inodes, list) {
         if (entry->ino == child->ino) {
             link_count++;
         }
     }
-    read_unlock(&vtfs_sb_info.lock);
+    
+    free_inodes_list(&inodes);
     
     if (link_count == 0) {
-        if (child->file) {
-            if (child->file->data)
-                kfree(child->file->data);
-            kfree(child->file);
+        del = kzalloc(HTTP_BUFFER_SIZE, GFP_KERNEL);
+        if (del) {
+            ino_str = kasprintf(GFP_KERNEL, "%lu", child->ino);
+            if (ino_str) {
+                vtfs_http_call(ENDPOINT_FILES, HTTP_METHOD_DELETE, del, HTTP_BUFFER_SIZE, 1, 
+                             "ino", ino_str);
+                kfree(ino_str);
+            }
+            kfree(del);
         }
     }
     
-    kfree(child);
-    
-    if (link_count > 0) {
+    if (link_count > 0 && child_dentry->d_inode) {
         drop_nlink(child_dentry->d_inode);
     }
+    
+    kfree(child);
     
     return 0;
 }
@@ -377,51 +661,59 @@ int vtfs_unlink(struct inode* parent_inode, struct dentry* child_dentry) {
 int vtfs_rmdir(struct inode* parent_inode, struct dentry* child_dentry) {
     const char* name = child_dentry->d_name.name;
     struct vtfs_inode_data *child;
+    int ret;
     
     child = vtfs_find_child(parent_inode->i_ino, name);
     if (!child)
         return -ENOENT;
     
-    if (!S_ISDIR(child->mode))
+    if (!S_ISDIR(child->mode)) {
+        kfree(child);
         return -ENOTDIR;
-    if (!vtfs_dir_is_empty(child->ino))
+    }
+    
+    if (!vtfs_dir_is_empty(child->ino)) {
+        kfree(child);
         return -ENOTEMPTY;
-
-    return vtfs_remove_inode(child->ino);
+    }
+    
+    ret = vtfs_remove_inode(child->ino);
+    kfree(child);
+    
+    return ret;
 }
 
 int vtfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry) {
     struct inode *inode = old_dentry->d_inode;
     const char *new_name = new_dentry->d_name.name;
     struct vtfs_inode_data *inode_data;
+    struct vtfs_inode_data *new_link;
     
     inode_data = vtfs_find_inode(inode->i_ino);
     if (!inode_data)
         return -ENOENT;
     
-    if (!S_ISREG(inode_data->mode))
+    if (!S_ISREG(inode_data->mode)) {
+        kfree(inode_data);
         return -EPERM;
+    }
     
-    if (vtfs_find_child(dir->i_ino, new_name))
+    if (vtfs_find_child(dir->i_ino, new_name)) {
+        kfree(inode_data);
         return -EEXIST;
+    }
     
-    struct vtfs_inode_data *new_link;
-    new_link = kzalloc(sizeof(*new_link), GFP_KERNEL);
+    new_link = vtfs_create_inode(
+        inode_data->ino, inode_data->mode, new_name, dir->i_ino
+    );
+    
+    kfree(inode_data);
+    
     if (!new_link)
         return -ENOMEM;
     
-    new_link->ino = inode_data->ino;
-    new_link->mode = inode_data->mode;
-    new_link->parent_ino = dir->i_ino;
-    new_link->file = inode_data->file;
-    strncpy(new_link->name, new_name, VTFS_MAX_NAME_LEN - 1);
-    new_link->name[VTFS_MAX_NAME_LEN - 1] = '\0';
-    
-    write_lock(&vtfs_sb_info.lock);
-    list_add_tail(&new_link->list, &vtfs_sb_info.inodes);
-    write_unlock(&vtfs_sb_info.lock);
-    
     inc_nlink(inode);
+    kfree(new_link);
     
     d_instantiate(new_dentry, igrab(inode));
     
@@ -429,16 +721,22 @@ int vtfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_d
 }
 
 int vtfs_fill_super(struct super_block* sb, void* data, int silent) {
-    INIT_LIST_HEAD(&vtfs_sb_info.inodes);
-    rwlock_init(&vtfs_sb_info.lock);
+    struct vtfs_inode_data *root_data;
+    struct inode* inode;
     
-    struct vtfs_inode_data *root_data = vtfs_create_inode(ROOT_INO, S_IFDIR | 0777, "", 0);
+    root_data = vtfs_create_inode(ROOT_INO, S_IFDIR | 0777, "", 0);
     if (!root_data)
         return -ENOMEM;
     
-    struct inode* inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0777, ROOT_INO);
+    inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0777, ROOT_INO);
+    kfree(root_data);
+    
+    if (!inode)
+        return -ENOMEM;
+    
     sb->s_root = d_make_root(inode);
     if (sb->s_root == NULL) {
+        iput(inode);
         return -ENOMEM;
     }
 
@@ -472,138 +770,237 @@ int vtfs_iterate(struct file* filp, struct dir_context* ctx) {
     struct dentry* dentry = filp->f_path.dentry;
     struct inode* inode = dentry->d_inode;
     struct vtfs_inode_data *entry;
-    int skip_count, current_pos;
-    
+    struct list_head inodes;
+    char *response_buffer = NULL;
+    int skip_count = 0;
+    int processed = 0;
+
     if (ctx->pos == 0) {
-        if (!dir_emit(ctx, ".", 1, inode->i_ino, DT_DIR))
+        if (!dir_emit(ctx, ".", 1, inode->i_ino, DT_DIR)) {
             return 0;
+        }
         ctx->pos++;
     }
-
+    
     if (ctx->pos == 1) {
         struct inode* parent_inode = dentry->d_parent->d_inode;
-        if (!dir_emit(ctx, "..", 2, parent_inode ? parent_inode->i_ino : 2, DT_DIR))
+        ino_t parent_ino = parent_inode ? parent_inode->i_ino : 2;
+        if (!dir_emit(ctx, "..", 2, parent_ino, DT_DIR)) {
             return 0;
+        }
         ctx->pos++;
     }
     
-    skip_count = ctx->pos - 2;
-    current_pos = 0;
+    if (ctx->pos >= 2) {
+        skip_count = (int)ctx->pos - 2;
+    }
     
-    read_lock(&vtfs_sb_info.lock);
+    INIT_LIST_HEAD(&inodes);
     
-    list_for_each_entry(entry, &vtfs_sb_info.inodes, list) {
+    response_buffer = kzalloc(LARGE_HTTP_BUFFER_SIZE, GFP_KERNEL);
+    if (!response_buffer) {
+        return 0;
+    }
+    
+    if (vtfs_http_call(ENDPOINT_GET_ALL, HTTP_METHOD_GET, response_buffer, LARGE_HTTP_BUFFER_SIZE, 0) < 0) {
+        kfree(response_buffer);
+        return 0;
+    }
+    
+    if (parse_inode_array(response_buffer, &inodes) != 0) {
+        kfree(response_buffer);
+        free_inodes_list(&inodes);
+        return 0;
+    }
+    
+    kfree(response_buffer);
+    
+    list_for_each_entry(entry, &inodes, list) {
         if (entry->parent_ino != inode->i_ino)
             continue;
             
-        if (current_pos < skip_count) {
-            current_pos++;
+        if (processed < skip_count) {
+            processed++;
             continue;
         }
         
-        unsigned char type;
-        if (S_ISDIR(entry->mode))
+        unsigned char type = DT_UNKNOWN;
+        if (S_ISDIR(entry->mode)) {
             type = DT_DIR;
-        else if (S_ISREG(entry->mode))
+        } else if (S_ISREG(entry->mode)) {
             type = DT_REG;
-        else
-            type = DT_UNKNOWN;
-            
+        } else if (S_ISLNK(entry->mode)) {
+            type = DT_LNK;
+        }
+        
         if (!dir_emit(ctx, entry->name, strlen(entry->name), entry->ino, type)) {
-            read_unlock(&vtfs_sb_info.lock);
+            free_inodes_list(&inodes);
             return 0;
         }
         
         ctx->pos++;
-        current_pos++;
+        processed++;
     }
     
-    read_unlock(&vtfs_sb_info.lock);
+    free_inodes_list(&inodes);
     
     return 0;
 }
 
-ssize_t vtfs_write(struct file *filp, const char __user *buffer, size_t len, loff_t *offset)
+ssize_t vtfs_write(struct file *filp,
+                   const char __user *buffer,
+                   size_t len,
+                   loff_t *offset)
 {
-    struct inode *inode = filp->f_path.dentry->d_inode;
-    struct vtfs_inode_data *inode_data;
-    size_t new_size, write_pos;
-    ssize_t ret;
-    
-    inode_data = vtfs_find_inode(inode->i_ino);
-    if (!inode_data)
-        return -ENOENT;
-    
-    if (filp->f_flags & O_APPEND) {
-        write_pos = inode_data->file->size;
-    } else {
-        write_pos = *offset;
+    struct inode *inode = filp->f_inode;
+    char *kbuf = NULL;
+    char *base64_buf = NULL;
+    char *response_buffer = NULL;
+    char *ino_str = NULL;
+    bool append;
+    ssize_t ret = 0;
+    size_t base64_len;
+
+    if (len == 0)
+        return 0;
+
+    append = filp->f_flags & O_APPEND;
+
+    kbuf = kmalloc(len, GFP_KERNEL);
+    if (!kbuf)
+        return -ENOMEM;
+
+    if (copy_from_user(kbuf, buffer, len)) {
+        ret = -EFAULT;
+        goto out;
     }
-    
-    new_size = write_pos + len;
-    
-    ret = vtfs_resize_file_data(inode_data, new_size);
-    if (ret)
-        return ret;
-    
-    if (inode_data->file->data) {
-        ret = copy_from_user(inode_data->file->data + write_pos, buffer, len);
-        if (ret)
-            return -EFAULT;
+
+    base64_len = (len + 2) / 3 * 4;
+    base64_buf = kmalloc(base64_len + 1, GFP_KERNEL);
+    if (!base64_buf) {
+        ret = -ENOMEM;
+        goto out;
     }
-    
-    inode_data->file->size = new_size;
-    
-    *offset = write_pos + len;
-    
-    return len;
+
+    ret = base64_encode(kbuf, len, base64_buf);
+    if (ret < 0) {
+        pr_err("Failed to encode base64: %ld\n", ret);
+        goto out;
+    }
+    base64_buf[base64_len] = '\0';
+
+    ino_str = kasprintf(GFP_KERNEL, "%lu", inode->i_ino);
+    if (!ino_str) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    response_buffer = kzalloc(HTTP_BUFFER_SIZE, GFP_KERNEL);
+    if (!response_buffer) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    if (append) {
+        ret = vtfs_http_call(
+            ENDPOINT_FILES,
+            HTTP_METHOD_PUT,
+            response_buffer,
+            HTTP_BUFFER_SIZE,
+            2,
+            "ino", ino_str,
+            "addData", base64_buf
+        );
+    }
+
+    else if (*offset == 0) {
+        ret = vtfs_http_call(
+            ENDPOINT_FILES,
+            HTTP_METHOD_POST,
+            response_buffer,
+            HTTP_BUFFER_SIZE,
+            2,
+            "ino", ino_str,
+            "data", base64_buf
+        );
+    }
+    else {
+        ret = -ESPIPE;
+        goto out;
+    }
+
+    if (ret < 0)
+        goto out;
+
+    *offset += len;
+    ret = len;
+
+out:
+    kfree(response_buffer);
+    kfree(ino_str);
+    kfree(base64_buf);
+    kfree(kbuf);
+    return ret;
 }
 
 ssize_t vtfs_read(struct file *filp, char __user *buffer, size_t len, loff_t *offset)
 {
-    struct inode *inode = filp->f_path.dentry->d_inode;
-    struct vtfs_inode_data *inode_data;
-    size_t to_read;
-    ssize_t ret;
+    struct inode *inode = file_inode(filp);
+    struct file_data fdata = {0};
+    char *response_buffer = NULL;
+    char *ino_str = NULL;
+    int64_t http_ret;
+    int ret;
     
-    inode_data = vtfs_find_inode(inode->i_ino);
-    if (!inode_data)
+    response_buffer = kzalloc(HTTP_BUFFER_SIZE, GFP_KERNEL);
+    if (!response_buffer)
+        return -ENOMEM;
+    
+    ino_str = kasprintf(GFP_KERNEL, "%lu", inode->i_ino);
+    if (!ino_str) {
+        kfree(response_buffer);
+        return -ENOMEM;
+    }
+    
+    http_ret = vtfs_http_call(ENDPOINT_FILE_BY_INO, HTTP_METHOD_GET, response_buffer, HTTP_BUFFER_SIZE, 1,
+                              "ino", ino_str);
+    kfree(ino_str);
+    
+    if (http_ret < 0) {
+        kfree(response_buffer);
         return -ENOENT;
+    }
     
-    if (!S_ISREG(inode_data->mode))
-        return -EINVAL;
+    ret = parse_json_file_data(response_buffer, &fdata);
+    kfree(response_buffer);
     
-    if (!inode_data->file->data || inode_data->file->size == 0)
+    if (ret < 0)
+        return ret;
+    
+    if (!fdata.data) {
         return 0;
+    }
     
-    if (*offset >= inode_data->file->size)
+    if (*offset >= fdata.size) {
+        kfree(fdata.data);
         return 0;
+    }
     
-    to_read = min(len, inode_data->file->size - *offset);
+    if (*offset + len > fdata.size)
+        len = fdata.size - *offset;
     
-    ret = copy_to_user(buffer, inode_data->file->data + *offset, to_read);
-    if (ret)
+    if (copy_to_user(buffer, fdata.data + *offset, len)) {
+        kfree(fdata.data);
         return -EFAULT;
+    }
     
-    *offset += to_read;
+    *offset += len;
+    kfree(fdata.data);
     
-    return to_read;
+    return len;
 }
 
 void vtfs_kill_sb(struct super_block* sb) {
-    struct vtfs_inode_data *entry, *tmp;
-    
-    write_lock(&vtfs_sb_info.lock);
-    list_for_each_entry_safe(entry, tmp, &vtfs_sb_info.inodes, list) {
-        list_del(&entry->list);
-        if (S_ISREG(entry->mode) && entry->file->data) {
-            kfree(entry->file->data);
-            kfree(entry->file);
-        }
-        kfree(entry);
-    }
-    write_unlock(&vtfs_sb_info.lock);
-    
     printk(KERN_INFO "[" MODULE_NAME "]: Super block destroyed. Unmount successful.\n");
 }
 
@@ -612,6 +1009,15 @@ int vtfs_permission(struct mnt_idmap* idmap, struct inode* inode, int mask) {
 }
 
 static int __init vtfs_init(void) {
+    char *ino = kzalloc(INO_BUFFER_SIZE, GFP_KERNEL);
+    if (!ino)
+        return -ENOMEM;
+        
+    if (vtfs_http_call(ENDPOINT_GET_MAX_INO, HTTP_METHOD_GET, ino, INO_BUFFER_SIZE, 0) >= 0) {
+        ino_cnt = simple_strtol(ino, NULL, 10);
+    }
+    kfree(ino);
+    
     int ret = register_filesystem(&vtfs_fs_type);
     if (ret) {
         printk(KERN_ERR "[" MODULE_NAME "]: Failed to register filesystem: %d\n", ret);

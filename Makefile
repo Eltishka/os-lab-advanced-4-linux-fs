@@ -7,7 +7,7 @@ MOUNT_TOKEN = "vtfs-token"
 
 # Настройки для сборки модуля ядра
 obj-m := $(MODULE_NAME).o
-$(MODULE_NAME)-objs := source/vtfs.o
+$(MODULE_NAME)-objs := source/vtfs.o source/http.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)

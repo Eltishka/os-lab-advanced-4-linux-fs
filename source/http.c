@@ -1,10 +1,20 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/string.h>
+#include <linux/slab.h>
+#include <linux/net.h>
+#include <linux/in.h>
+#include <linux/inet.h>
+#include <net/sock.h>
+#include <linux/uio.h>
 #include "http.h"
 
-const char *SERVER_IP = "0.0.0.0";
+const char *SERVER_IP = "10.0.2.2";
 const int SERVER_PORT = 8080;
 
 // callee should call free_request on received buffer
-int fill_request(struct kvec *vec, const char *token, const char *method,
+int fill_request(struct kvec *vec, const char *path, const char *method,
                  size_t arg_size, va_list args) {
   // 2048 bytes for URL and 64 bytes for anything else
   char *request_buffer = kzalloc(2048 + 64, GFP_KERNEL);
@@ -12,13 +22,14 @@ int fill_request(struct kvec *vec, const char *token, const char *method,
     return -ENOMEM;
   }
 
-  strcpy(request_buffer, "GET /api/");
-  strcat(request_buffer, method);
+  strcpy(request_buffer, method);
+  strcat(request_buffer, " ");
 
-  strcat(request_buffer, "?token=");
-  strcat(request_buffer, token);
+  strcat(request_buffer, path);
 
+  strcat(request_buffer, "?useles=123");
   for (int i = 0; i < arg_size; i++) {
+    
     strcat(request_buffer, "&");
     strcat(request_buffer, va_arg(args, char *));
     strcat(request_buffer, "=");
@@ -62,17 +73,27 @@ int receive_all(struct socket *sock, char *buffer, size_t buffer_size) {
 int64_t parse_http_response(char *raw_response, size_t raw_response_size,
                             char *response, size_t response_size) {
   char *buffer = raw_response;
-
+  
   // Read Response Line
   {
     char *status_line = strsep(&buffer, "\r");
-    strsep(&status_line, " ");
-    if (status_line == 0) {
+    if (!status_line) {
+      printk(KERN_ERR "No status line found\n");
       return -6;
     }
-    char *status_code = strsep(&status_line, " ");
-    printk(KERN_INFO "Received response with status code %s\n", status_code);
-    if (strcmp(status_code, "200") != 0) {
+    
+    // Пропускаем "HTTP/1.1 "
+    char *status_code = status_line;
+    while (*status_code && *status_code != ' ') status_code++;
+    if (*status_code) status_code++; // пропускаем пробел
+    
+    // Берем код статуса (3 цифры)
+    char code[4] = {0};
+    strncpy(code, status_code, 3);
+    
+    printk(KERN_INFO "Received response with status code %s\n", code);
+    
+    if (strcmp(code, "200") != 0) {
       return -5;
     }
   }
@@ -80,12 +101,21 @@ int64_t parse_http_response(char *raw_response, size_t raw_response_size,
   int length = -1;
 
   while (true) {
-    if (buffer == 0) {
+    if (!buffer || *buffer == '\0') {
+      printk(KERN_ERR "Unexpected end of headers\n");
       return -6;
     }
+    
     char *header = strsep(&buffer, "\r");
-    ++header; // skip \n
-    if (strcmp(header, "") == 0) {
+    if (!header) {
+      printk(KERN_ERR "Failed to parse header\n");
+      return -6;
+    }
+    
+    // Пропускаем \n
+    if (*header == '\n') header++;
+    
+    if (strlen(header) == 0) {
       // end of headers
       break;
     }
@@ -93,38 +123,39 @@ int64_t parse_http_response(char *raw_response, size_t raw_response_size,
     if (strncmp(header, "Content-Length: ", 16) == 0) {
       int error = kstrtoint(header + 16, 0, &length);
       if (error != 0) {
+        printk(KERN_ERR "Failed to parse Content-Length\n");
         return -6;
       }
       printk(KERN_INFO "Received response with content length %d\n", length);
     }
   }
-  ++buffer; // skip last '\n'
+  
+  if (*buffer == '\n') buffer++; // skip last '\n'
+  if (*buffer == '\r') buffer++; // skip '\r' if present
 
   if (length == -1) {
+    printk(KERN_ERR "No Content-Length header found\n");
     return -6;
   }
 
   if (buffer + length > raw_response + raw_response_size) {
+    printk(KERN_ERR "Response body exceeds buffer size\n");
     return -6;
   }
 
-  if (length < sizeof(int64_t)) {
-    return -7;
-  }
-
-  length -= sizeof(int64_t);
-
+  // Копируем тело ответа (JSON) в response_buffer
   if (length > response_size) {
+    printk(KERN_ERR "Response too large for buffer\n");
     return -ENOSPC;
   }
 
-  int64_t return_value;
-  memcpy(&return_value, buffer, sizeof(int64_t));
-
-  buffer += sizeof(int64_t);
   memcpy(response, buffer, length);
-
-  return return_value;
+  response[length] = '\0'; // добавляем null-terminator
+  
+  printk(KERN_INFO "Response body: %s\n", response);
+  
+  // Для совместимости с существующим кодом возвращаем длину
+  return length;
 }
 
 int64_t vtfs_http_call(const char *token, const char *method,
@@ -174,7 +205,7 @@ int64_t vtfs_http_call(const char *token, const char *method,
     return -3;
   }
 
-  size_t raw_buffer_size = buffer_size + 1024; // add 1KB for HTTP headers
+  size_t raw_buffer_size = buffer_size + 8192; // add 1KB for HTTP headers
   char *raw_response_buffer = kmalloc(raw_buffer_size, GFP_KERNEL);
   if (raw_response_buffer == 0) {
     kernel_sock_shutdown(sock, SHUT_RDWR);
